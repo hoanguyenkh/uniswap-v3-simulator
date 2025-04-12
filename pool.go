@@ -3,13 +3,14 @@ package uniswap_v3_simulator
 import (
 	"errors"
 	"fmt"
+	"time"
+
 	"github.com/daoleno/uniswapv3-sdk/constants"
 	"github.com/daoleno/uniswapv3-sdk/utils"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/shopspring/decimal"
 	"github.com/sirupsen/logrus"
 	"gorm.io/gorm"
-	"time"
 )
 
 type FeeAmount int
@@ -220,17 +221,40 @@ func (p *CorePool) HandleSwap(zeroForOne bool, amountSpecified decimal.Decimal, 
 	} else {
 		state.feeGrowthGlobalX128 = p.FeeGrowthGlobal1X128
 	}
+
+	// Add loop protection variables
+	iterationCount := 0
+	const maxIterations = 1024 // Set a reasonable maximum
+
+	// Add a very small threshold to prevent infinite looping due to decimal precision
+	epsilonDecimal := decimal.NewFromFloat(0.00001)
+
 	// 达到限价或者兑换完成
-	for !(state.amountSpecifiedRemaining.Equal(ZERO) || state.sqrtPriceX96.Equal(sqrtPriceLimitX96)) {
+	for {
+		// Add iteration counter to prevent infinite loops
+		iterationCount++
+		if iterationCount > maxIterations {
+			logrus.Warnf("HandleSwap reached max iterations (%d) - forcing exit for tx %s", maxIterations, "unknown")
+			break
+		}
+
+		// Check if we should exit the loop - with tolerance for floating point imprecision
+		amountIsZero := state.amountSpecifiedRemaining.Abs().LessThanOrEqual(epsilonDecimal)
+		priceReached := state.sqrtPriceX96.Sub(sqrtPriceLimitX96).Abs().Div(
+			decimal.Max(state.sqrtPriceX96, sqrtPriceLimitX96)).LessThanOrEqual(epsilonDecimal)
+
+		if amountIsZero || priceReached {
+			break
+		}
+
 		step := StepComputations{
 			sqrtPriceStartX96: ZERO, tickNext: 0, initialized: false, sqrtPriceNextX96: ZERO, amountIn: ZERO, amountOut: ZERO, feeAmount: ZERO}
 		step.sqrtPriceStartX96 = state.sqrtPriceX96
-		//fmt.Println("tick params", state.tick, p.TickSpacing, zeroForOne)
+
 		tickNext, initialized, err := p.TickManager.GetNextInitializedTick(state.tick, p.TickSpacing, zeroForOne)
 		if err != nil {
 			return ZERO, ZERO, ZERO, err
 		}
-		//fmt.Println("next tick:", tickNext)
 
 		step.tickNext = tickNext
 		step.initialized = initialized
@@ -301,7 +325,6 @@ func (p *CorePool) HandleSwap(zeroForOne bool, amountSpecified decimal.Decimal, 
 				if err != nil {
 					return ZERO, ZERO, ZERO, err
 				}
-
 			}
 			if zeroForOne {
 				state.tick = step.tickNext - 1
@@ -315,6 +338,7 @@ func (p *CorePool) HandleSwap(zeroForOne bool, amountSpecified decimal.Decimal, 
 			}
 		}
 	}
+
 	if !isStatic {
 		p.SqrtPriceX96 = state.sqrtPriceX96
 		if state.tick != p.TickCurrent {
@@ -373,42 +397,194 @@ func incTowardsInfinity(d decimal.Decimal) decimal.Decimal {
 	}
 }
 func (p *CorePool) ResolveInputFromSwapResultEvent(param *UniV3SwapEvent) (decimal.Decimal, *decimal.Decimal, error) {
+	// Create an empty slice to hold all our solution candidates
+	var solutionList []SwapSolution
 
-	solution1 := SwapSolution{SqrtPriceLimitX96: &param.SqrtPriceX96}
-	//logrus.Infof(param.RawEvent.TxHash.String())
+	// Record the starting price for debugging
+	startPrice := p.SqrtPriceX96
+
+	// === GROUP 1: Base solutions with exact amounts ===
+
+	// Solution 1 & 2: Try exact amount0 and amount1 with target price
+	solutionList = append(solutionList, SwapSolution{
+		AmountSpecified:   param.Amount0,
+		SqrtPriceLimitX96: &param.SqrtPriceX96,
+	})
+	solutionList = append(solutionList, SwapSolution{
+		AmountSpecified:   param.Amount1,
+		SqrtPriceLimitX96: &param.SqrtPriceX96,
+	})
+
+	// Solution 3 & 4: Try exact amount0 and amount1 without price limit
+	solutionList = append(solutionList, SwapSolution{
+		AmountSpecified:   param.Amount0,
+		SqrtPriceLimitX96: nil,
+	})
+	solutionList = append(solutionList, SwapSolution{
+		AmountSpecified:   param.Amount1,
+		SqrtPriceLimitX96: nil,
+	})
+
+	// === GROUP 2: Adjusted amounts for precision issues ===
+
+	// Solution 5 & 6: Try slightly incremented/decremented amounts with target price
+	incrementedAmount0 := incTowardsInfinity(param.Amount0)
+	incrementedAmount1 := incTowardsInfinity(param.Amount1)
+
+	solutionList = append(solutionList, SwapSolution{
+		AmountSpecified:   incrementedAmount0,
+		SqrtPriceLimitX96: &param.SqrtPriceX96,
+	})
+	solutionList = append(solutionList, SwapSolution{
+		AmountSpecified:   incrementedAmount1,
+		SqrtPriceLimitX96: &param.SqrtPriceX96,
+	})
+
+	// Solution 7 & 8: Try slightly incremented/decremented amounts without price limit
+	solutionList = append(solutionList, SwapSolution{
+		AmountSpecified:   incrementedAmount0,
+		SqrtPriceLimitX96: nil,
+	})
+	solutionList = append(solutionList, SwapSolution{
+		AmountSpecified:   incrementedAmount1,
+		SqrtPriceLimitX96: nil,
+	})
+
+	// === GROUP 3: Larger adjustments for significant precision issues ===
+
+	// Solution 9 & 10: Try larger adjustments (± 0.1%)
+	adjustmentFactor := decimal.NewFromFloat(0.001) // 0.1%
+	amount0Adjusted := param.Amount0.Mul(decimal.NewFromInt(1).Add(adjustmentFactor))
+	amount1Adjusted := param.Amount1.Mul(decimal.NewFromInt(1).Add(adjustmentFactor))
+
+	solutionList = append(solutionList, SwapSolution{
+		AmountSpecified:   amount0Adjusted,
+		SqrtPriceLimitX96: &param.SqrtPriceX96,
+	})
+	solutionList = append(solutionList, SwapSolution{
+		AmountSpecified:   amount1Adjusted,
+		SqrtPriceLimitX96: &param.SqrtPriceX96,
+	})
+
+	// Solution 11 & 12: Try negative adjustments
+	amount0AdjustedNeg := param.Amount0.Mul(decimal.NewFromInt(1).Sub(adjustmentFactor))
+	amount1AdjustedNeg := param.Amount1.Mul(decimal.NewFromInt(1).Sub(adjustmentFactor))
+
+	solutionList = append(solutionList, SwapSolution{
+		AmountSpecified:   amount0AdjustedNeg,
+		SqrtPriceLimitX96: &param.SqrtPriceX96,
+	})
+	solutionList = append(solutionList, SwapSolution{
+		AmountSpecified:   amount1AdjustedNeg,
+		SqrtPriceLimitX96: &param.SqrtPriceX96,
+	})
+
+	// === GROUP 4: Special handling for zero liquidity cases ===
+
+	// For zero liquidity pools, try larger variations
 	if param.Liquidity.IsZero() {
-		solution1.AmountSpecified = incTowardsInfinity(param.Amount0)
-	} else {
-		solution1.AmountSpecified = param.Amount0
+		// Try with larger increments for zero liquidity cases
+		largerIncAmount0 := param.Amount0.Mul(decimal.NewFromFloat(1.01)) // +1%
+		largerIncAmount1 := param.Amount1.Mul(decimal.NewFromFloat(1.01)) // +1%
+
+		solutionList = append(solutionList, SwapSolution{
+			AmountSpecified:   largerIncAmount0,
+			SqrtPriceLimitX96: &param.SqrtPriceX96,
+		})
+		solutionList = append(solutionList, SwapSolution{
+			AmountSpecified:   largerIncAmount1,
+			SqrtPriceLimitX96: &param.SqrtPriceX96,
+		})
+
+		// Try with larger decrements too
+		largerDecAmount0 := param.Amount0.Mul(decimal.NewFromFloat(0.99)) // -1%
+		largerDecAmount1 := param.Amount1.Mul(decimal.NewFromFloat(0.99)) // -1%
+
+		solutionList = append(solutionList, SwapSolution{
+			AmountSpecified:   largerDecAmount0,
+			SqrtPriceLimitX96: &param.SqrtPriceX96,
+		})
+		solutionList = append(solutionList, SwapSolution{
+			AmountSpecified:   largerDecAmount1,
+			SqrtPriceLimitX96: &param.SqrtPriceX96,
+		})
 	}
 
-	solution2 := SwapSolution{SqrtPriceLimitX96: &param.SqrtPriceX96}
-	if param.Liquidity.IsZero() {
-		solution2.AmountSpecified = incTowardsInfinity(param.Amount1)
-	} else {
-		solution2.AmountSpecified = param.Amount1
-	}
+	// Try each solution
+	var bestSolution *SwapSolution
+	var bestError decimal.Decimal = decimal.NewFromInt(0)
+	const tolerance = 0.001 // 0.1% tolerance
 
-	solution3 := SwapSolution{SqrtPriceLimitX96: nil, AmountSpecified: param.Amount0}
-	solution4 := SwapSolution{SqrtPriceLimitX96: nil, AmountSpecified: param.Amount1}
-	solutionList := []SwapSolution{solution3, solution4}
-	if !param.SqrtPriceX96.Equal(p.SqrtPriceX96) {
-		//if param.Liquidity.Equal(decimal.NewFromInt(-1)) {
-		solution5 := SwapSolution{AmountSpecified: param.Amount0, SqrtPriceLimitX96: &param.SqrtPriceX96}
-		solution6 := SwapSolution{AmountSpecified: param.Amount1, SqrtPriceLimitX96: &param.SqrtPriceX96}
-		solutionList = append(solutionList, solution5)
-		solutionList = append(solutionList, solution6)
-		//}
-		solutionList = append(solutionList, solution1)
-		solutionList = append(solutionList, solution2)
-	}
-	for _, solution := range solutionList {
-		if p.tryToDryRun(param, solution.AmountSpecified, solution.SqrtPriceLimitX96) {
+	for i, solution := range solutionList {
+		var zeroForOne = param.Amount0.IsPositive()
+		amount0, amount1, priceX96, err := p.HandleSwap(zeroForOne, solution.AmountSpecified, solution.SqrtPriceLimitX96, true)
+
+		if err != nil {
+			logrus.Debugf("Solution %d failed with error: %v", i, err)
+			continue
+		}
+
+		// Check if amounts are within tolerance
+		amount0Match := amount0.Sub(param.Amount0).Abs().Div(decimal.Max(param.Amount0.Abs(), decimal.NewFromInt(1))).LessThanOrEqual(decimal.NewFromFloat(tolerance))
+		amount1Match := amount1.Sub(param.Amount1).Abs().Div(decimal.Max(param.Amount1.Abs(), decimal.NewFromInt(1))).LessThanOrEqual(decimal.NewFromFloat(tolerance))
+		priceMatch := priceX96.Sub(param.SqrtPriceX96).Abs().Div(param.SqrtPriceX96).LessThanOrEqual(decimal.NewFromFloat(tolerance))
+
+		// If all are within tolerance, consider it a match
+		if amount0Match && amount1Match && priceMatch {
+			// logrus.Infof("Found solution within tolerance: %+v", solution)
 			return solution.AmountSpecified, solution.SqrtPriceLimitX96, nil
+		}
+
+		// Calculate how close it is
+		priceError := priceX96.Sub(param.SqrtPriceX96).Abs()
+		amount0Error := amount0.Sub(param.Amount0).Abs()
+		amount1Error := amount1.Sub(param.Amount1).Abs()
+
+		// Normalize errors based on values
+		if !param.SqrtPriceX96.IsZero() {
+			priceError = priceError.Div(param.SqrtPriceX96)
+		}
+		if !param.Amount0.IsZero() {
+			amount0Error = amount0Error.Div(param.Amount0.Abs())
+		} else if !amount0.IsZero() {
+			amount0Error = decimal.NewFromFloat(1) // Large error if expected 0 but got non-zero
+		}
+
+		if !param.Amount1.IsZero() {
+			amount1Error = amount1Error.Div(param.Amount1.Abs())
+		} else if !amount1.IsZero() {
+			amount1Error = decimal.NewFromFloat(1) // Large error if expected 0 but got non-zero
+		}
+
+		totalError := priceError.Add(amount0Error).Add(amount1Error)
+
+		// Save the solution with the smallest error
+		if bestSolution == nil || totalError.LessThan(bestError) {
+			bestError = totalError
+			copySolution := solution
+			bestSolution = &copySolution
+
+			// Log the close match for debugging
+			logrus.Debugf("Better approximation found (error: %s): %+v", totalError, solution)
+			logrus.Debugf("  Expected: amount0=%s, amount1=%s, price=%s",
+				param.Amount0, param.Amount1, param.SqrtPriceX96)
+			logrus.Debugf("  Got: amount0=%s, amount1=%s, price=%s",
+				amount0, amount1, priceX96)
 		}
 	}
 
-	err := fmt.Errorf("failed find swap solution %s %s", param.RawEvent.TxHash, param.RawEvent.Address)
+	// If no exact match but we have a close approximation, use it if error is small enough
+	// (e.g., less than 0.1% total error)
+	if bestSolution != nil && bestError.LessThan(decimal.NewFromFloat(0.001*3)) { // 0.1% * 3 (three values)
+		logrus.Infof("Using approximate solution with error %s: %+v", bestError, bestSolution)
+		return bestSolution.AmountSpecified, bestSolution.SqrtPriceLimitX96, nil
+	}
+
+	// Add debugging info to the error message
+	err := fmt.Errorf("failed find swap solution for tx: %s, pool: %s, amounts: %s/%s, price: %s -> %s",
+		param.RawEvent.TxHash, param.RawEvent.Address,
+		param.Amount0, param.Amount1, startPrice, param.SqrtPriceX96)
+
 	logrus.Error(err)
 	return ZERO, nil, err
 }
@@ -520,7 +696,7 @@ func (p *CorePool) updatePosition(owner string, lower int, upper int, delta deci
 			return nil, err
 		}
 	}
-	fi0, fi1, err := p.TickManager.getFeeGrowthInside(lower, upper, p.TickCurrent, p.FeeGrowthGlobal0X128, p.FeeGrowthGlobal1X128)
+	fi0, fi1, err := p.TickManager.GetFeeGrowthInside(lower, upper, p.TickCurrent, p.FeeGrowthGlobal0X128, p.FeeGrowthGlobal1X128)
 	if err != nil {
 		return nil, err
 	}

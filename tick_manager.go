@@ -227,7 +227,7 @@ func (tm *TickManager) GetNextInitializedTick(tick, tickSpacing int, lte bool) (
 	}
 }
 
-func (tm *TickManager) getFeeGrowthInside(tickLower, tickUpper, tickCurrent int, feeGrowthGlobal0X128, feeGrowthGlobal1X128 decimal.Decimal) (decimal.Decimal, decimal.Decimal, error) {
+func (tm *TickManager) GetFeeGrowthInside(tickLower, tickUpper, tickCurrent int, feeGrowthGlobal0X128, feeGrowthGlobal1X128 decimal.Decimal) (decimal.Decimal, decimal.Decimal, error) {
 	_, lok := tm.Ticks[tickLower]
 	_, uok := tm.Ticks[tickUpper]
 	if !lok || !uok {
