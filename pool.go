@@ -520,7 +520,7 @@ func (p *CorePool) updatePosition(owner string, lower int, upper int, delta deci
 			return nil, err
 		}
 	}
-	fi0, fi1, err := p.TickManager.getFeeGrowthInside(lower, upper, p.TickCurrent, p.FeeGrowthGlobal0X128, p.FeeGrowthGlobal1X128)
+	fi0, fi1, err := p.TickManager.GetFeeGrowthInside(lower, upper, p.TickCurrent, p.FeeGrowthGlobal0X128, p.FeeGrowthGlobal1X128)
 	if err != nil {
 		return nil, err
 	}
