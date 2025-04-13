@@ -3,14 +3,13 @@ package uniswap_v3_simulator
 import (
 	"errors"
 	"fmt"
-	re "time"
-
 	"github.com/daoleno/uniswapv3-sdk/constants"
 	"github.com/daoleno/uniswapv3-sdk/utils"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/shopspring/decimal"
 	"github.com/sirupsen/logrus"
 	"gorm.io/gorm"
+	"time"
 )
 
 type FeeAmount int
