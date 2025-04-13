@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+
 	"github.com/shopspring/decimal"
 )
 
@@ -52,8 +53,17 @@ func (p *Position) Update(
 			return err
 		}
 	}
-	tokensOwed0 := feeGrowthInside0X128.Sub(p.FeeGrowthInside0LastX128).Mul(p.Liquidity).Div(Q128).RoundDown(0)
-	tokensOwed1 := feeGrowthInside1X128.Sub(p.FeeGrowthInside1LastX128).Mul(p.Liquidity).Div(Q128).RoundDown(0)
+	tokensOwed0, err := Mod256Sub(feeGrowthInside0X128, p.FeeGrowthInside0LastX128)
+	if err != nil {
+		return err
+	}
+	tokensOwed0 = tokensOwed0.Mul(p.Liquidity).Div(Q128).RoundDown(0)
+
+	tokensOwed1, err := Mod256Sub(feeGrowthInside1X128, p.FeeGrowthInside1LastX128)
+	if err != nil {
+		return err
+	}
+	tokensOwed1 = tokensOwed1.Mul(p.Liquidity).Div(Q128).RoundDown(0)
 	if !liquidityDelta.IsZero() {
 		p.Liquidity = liquidityNext
 	}

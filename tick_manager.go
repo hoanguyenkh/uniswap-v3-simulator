@@ -276,14 +276,6 @@ func (tm *TickManager) GetFeeGrowthInside(tickLower, tickUpper, tickCurrent int,
 		}
 	}
 
-	// Commented out old code
-	//feeGrowthInside0 := feeGrowthGlobal0X128.Sub(feeGrowthBelow0X128)
-	//feeGrowthInside0 = feeGrowthInside0.Sub(feeGrowthAbove0X128)
-	//
-	//feeGrowthInside1 := feeGrowthGlobal1X128.Sub(feeGrowthBelow1X128)
-	//feeGrowthInside1 = feeGrowthInside1.Sub(feeGrowthAbove1X128)
-	//return feeGrowthInside0, feeGrowthInside1, nil
-
 	result1, err := Mod256Sub(feeGrowthGlobal0X128, feeGrowthBelow0X128)
 	if err != nil {
 		return ZERO, ZERO, err

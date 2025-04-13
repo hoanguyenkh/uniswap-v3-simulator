@@ -5,7 +5,6 @@ import (
 	"math"
 	"math/big"
 
-	"github.com/daoleno/uniswapv3-sdk/constants"
 	"github.com/shopspring/decimal"
 )
 
@@ -210,7 +209,7 @@ func GetSqrtRatioAtTick(tick int) (decimal.Decimal, error) {
 var ErrInvalidInput = errors.New("invalid input")
 
 func MostSignificantBit(x *big.Int) (int64, error) {
-	if x.Cmp(constants.Zero) <= 0 {
+	if x.Cmp(big.NewInt(0)) <= 0 {
 		return 0, ErrInvalidInput
 	}
 	if x.Cmp(MaxUint256.BigInt()) > 0 {
