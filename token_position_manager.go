@@ -262,10 +262,11 @@ func (tpm *TokenPositionManager) HandleMint(tokenID uint64, owner string, pool s
 }
 
 // HandleIncreaseLiquidity processes an increase liquidity event
-func (tpm *TokenPositionManager) HandleIncreaseLiquidity(tokenID uint64, amount decimal.Decimal, feeGrowthInside0X128 decimal.Decimal, feeGrowthInside1X128 decimal.Decimal) error {
+func (tpm *TokenPositionManager) HandleIncreaseLiquidity(tokenID uint64, owner string, pool string, tickLower int, tickUpper int, amount decimal.Decimal, feeGrowthInside0X128 decimal.Decimal, feeGrowthInside1X128 decimal.Decimal) error {
 	position, exists := tpm.Positions[tokenID]
 	if !exists {
-		return fmt.Errorf("position with tokenID %d does not exist", tokenID)
+		// Create new position
+		position = tpm.CreatePosition(tokenID, owner, pool, tickLower, tickUpper)
 	}
 
 	return position.IncreaseLiquidity(amount, feeGrowthInside0X128, feeGrowthInside1X128)
