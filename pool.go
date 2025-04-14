@@ -179,6 +179,7 @@ type StepComputations struct {
 }
 
 func (p *CorePool) HandleSwap(zeroForOne bool, amountSpecified decimal.Decimal, optionalSqrtPriceLimitX96 *decimal.Decimal, isStatic bool) (decimal.Decimal, decimal.Decimal, decimal.Decimal, error) {
+	// Set price limit based on direction if not provided
 	var sqrtPriceLimitX96 decimal.Decimal
 	if optionalSqrtPriceLimitX96 == nil {
 		if zeroForOne {
@@ -190,23 +191,27 @@ func (p *CorePool) HandleSwap(zeroForOne bool, amountSpecified decimal.Decimal, 
 		sqrtPriceLimitX96 = *optionalSqrtPriceLimitX96
 	}
 
+	// Validate price limits
 	if zeroForOne {
 		if !sqrtPriceLimitX96.GreaterThan(MIN_SQRT_RATIO) {
-			return ZERO, ZERO, ZERO, errors.New("RATIO_MIN")
+			return ZERO, ZERO, ZERO, fmt.Errorf("price limit (%s) below minimum allowed ratio (%s)", sqrtPriceLimitX96, MIN_SQRT_RATIO)
 		}
 		if !sqrtPriceLimitX96.LessThan(p.SqrtPriceX96) {
-			return ZERO, ZERO, ZERO, errors.New("RATIO_CURRENT")
+			return ZERO, ZERO, ZERO, fmt.Errorf("price limit (%s) must be less than current price (%s) for token0 -> token1 swap", sqrtPriceLimitX96, p.SqrtPriceX96)
 		}
 	} else {
 		if !sqrtPriceLimitX96.LessThan(MAX_SQRT_RATIO) {
-			return ZERO, ZERO, ZERO, errors.New("RATIO_MAX")
+			return ZERO, ZERO, ZERO, fmt.Errorf("price limit (%s) above maximum allowed ratio (%s)", sqrtPriceLimitX96, MAX_SQRT_RATIO)
 		}
 		if !sqrtPriceLimitX96.GreaterThan(p.SqrtPriceX96) {
-			return ZERO, ZERO, ZERO, errors.New("RATIO_CURRENT")
+			return ZERO, ZERO, ZERO, fmt.Errorf("price limit (%s) must be greater than current price (%s) for token1 -> token0 swap", sqrtPriceLimitX96, p.SqrtPriceX96)
 		}
 	}
 
+	// Determine exact input vs exact output
 	exactInput := amountSpecified.GreaterThanOrEqual(ZERO)
+
+	// Initialize swap state
 	state := swapState{
 		amountSpecifiedRemaining: amountSpecified,
 		amountCalculated:         ZERO,
@@ -215,35 +220,62 @@ func (p *CorePool) HandleSwap(zeroForOne bool, amountSpecified decimal.Decimal, 
 		liquidity:                p.Liquidity,
 	}
 
+	// Initialize fee growth value based on swap direction
 	if zeroForOne {
 		state.feeGrowthGlobalX128 = p.FeeGrowthGlobal0X128
 	} else {
 		state.feeGrowthGlobalX128 = p.FeeGrowthGlobal1X128
 	}
-	// 达到限价或者兑换完成
+
+	// Debug log swap initiation if in debug mode
+	if logrus.GetLevel() >= logrus.DebugLevel {
+		logrus.Debugf("Initiating swap: zeroForOne=%t, exactInput=%t, amountSpecified=%s, currentPrice=%s, limitPrice=%s",
+			zeroForOne, exactInput, amountSpecified, p.SqrtPriceX96, sqrtPriceLimitX96)
+	}
+
+	// Main swap loop - continue until amount is used up or price limit is reached
+	loopCount := 0
 	for !(state.amountSpecifiedRemaining.Equal(ZERO) || state.sqrtPriceX96.Equal(sqrtPriceLimitX96)) {
+		// Safety check for infinite loops
+		loopCount++
+		if loopCount > 1000 {
+			return ZERO, ZERO, ZERO, fmt.Errorf("excessive loop iterations in swap calculation (>1000)")
+		}
+
 		step := StepComputations{
-			sqrtPriceStartX96: ZERO, tickNext: 0, initialized: false, sqrtPriceNextX96: ZERO, amountIn: ZERO, amountOut: ZERO, feeAmount: ZERO}
-		step.sqrtPriceStartX96 = state.sqrtPriceX96
-		//fmt.Println("tick params", state.tick, p.TickSpacing, zeroForOne)
+			sqrtPriceStartX96: state.sqrtPriceX96,
+			tickNext:          0,
+			initialized:       false,
+			sqrtPriceNextX96:  ZERO,
+			amountIn:          ZERO,
+			amountOut:         ZERO,
+			feeAmount:         ZERO,
+		}
+
+		// Find the next initialized tick
 		tickNext, initialized, err := p.TickManager.GetNextInitializedTick(state.tick, p.TickSpacing, zeroForOne)
 		if err != nil {
-			return ZERO, ZERO, ZERO, err
+			return ZERO, ZERO, ZERO, fmt.Errorf("error finding next tick: %w", err)
 		}
-		//fmt.Println("next tick:", tickNext)
 
 		step.tickNext = tickNext
 		step.initialized = initialized
+
+		// Ensure we stay within valid tick bounds
 		if step.tickNext < MIN_TICK {
 			step.tickNext = MIN_TICK
 		} else if step.tickNext > MAX_TICK {
 			step.tickNext = MAX_TICK
 		}
+
+		// Get the sqrt price at the next tick
 		sqrtPriceNextX96bi, err := utils.GetSqrtRatioAtTick(step.tickNext)
 		if err != nil {
-			return ZERO, ZERO, ZERO, err
+			return ZERO, ZERO, ZERO, fmt.Errorf("error getting sqrt ratio at tick %d: %w", step.tickNext, err)
 		}
 		step.sqrtPriceNextX96 = decimal.NewFromBigInt(sqrtPriceNextX96bi, 0)
+
+		// Determine target price for this step
 		var sqrtRatioTargetX96 decimal.Decimal
 		if zeroForOne {
 			if step.sqrtPriceNextX96.LessThan(sqrtPriceLimitX96) {
@@ -258,16 +290,26 @@ func (p *CorePool) HandleSwap(zeroForOne bool, amountSpecified decimal.Decimal, 
 				sqrtRatioTargetX96 = step.sqrtPriceNextX96
 			}
 		}
-		_sqrtPriceX96, _amountIn, _amountOut, _feeAmount, err := utils.ComputeSwapStep(state.sqrtPriceX96.BigInt(), sqrtRatioTargetX96.BigInt(), state.liquidity.BigInt(), state.amountSpecifiedRemaining.BigInt(), constants.FeeAmount(p.Fee))
+
+		// Compute the actual swap step
+		_sqrtPriceX96, _amountIn, _amountOut, _feeAmount, err := utils.ComputeSwapStep(
+			state.sqrtPriceX96.BigInt(),
+			sqrtRatioTargetX96.BigInt(),
+			state.liquidity.BigInt(),
+			state.amountSpecifiedRemaining.BigInt(),
+			constants.FeeAmount(p.Fee),
+		)
 		if err != nil {
-			return ZERO, ZERO, ZERO, err
+			return ZERO, ZERO, ZERO, fmt.Errorf("error computing swap step: %w", err)
 		}
 
+		// Update state based on step computation
 		state.sqrtPriceX96 = decimal.NewFromBigInt(_sqrtPriceX96, 0)
 		step.amountIn = decimal.NewFromBigInt(_amountIn, 0)
 		step.amountOut = decimal.NewFromBigInt(_amountOut, 0)
 		step.feeAmount = decimal.NewFromBigInt(_feeAmount, 0)
 
+		// Update remaining amounts based on exact input or output
 		if exactInput {
 			state.amountSpecifiedRemaining = state.amountSpecifiedRemaining.Sub(step.amountIn.Add(step.feeAmount))
 			state.amountCalculated = state.amountCalculated.Sub(step.amountOut)
@@ -275,46 +317,70 @@ func (p *CorePool) HandleSwap(zeroForOne bool, amountSpecified decimal.Decimal, 
 			state.amountSpecifiedRemaining = state.amountSpecifiedRemaining.Add(step.amountOut)
 			state.amountCalculated = state.amountCalculated.Add(step.amountIn.Add(step.feeAmount))
 		}
+
+		// Update fee growth if there's liquidity
 		if state.liquidity.IsPositive() {
-			state.feeGrowthGlobalX128 = state.feeGrowthGlobalX128.Add(step.feeAmount.Mul(Q128).Div(state.liquidity).RoundDown(0))
+			feeGrowthDelta := step.feeAmount.Mul(Q128).Div(state.liquidity)
+			// Make sure to round down to avoid overcharging fees
+			state.feeGrowthGlobalX128 = state.feeGrowthGlobalX128.Add(feeGrowthDelta.RoundDown(0))
 		}
+
+		// Handle crossing tick boundary
 		if state.sqrtPriceX96.Equal(step.sqrtPriceNextX96) {
 			if step.initialized {
+				// Get the tick and handle crossing it
 				nextTick, err := p.TickManager.GetTickAndInitIfAbsent(step.tickNext)
 				if err != nil {
-					return ZERO, ZERO, ZERO, err
+					return ZERO, ZERO, ZERO, fmt.Errorf("error getting tick %d: %w", step.tickNext, err)
 				}
+
 				var liquidityNet decimal.Decimal
 				if isStatic {
+					// For simulation, just read the value without updating state
 					liquidityNet = nextTick.LiquidityNet
 				} else {
+					// For actual swap, cross the tick and update fee growth
 					if zeroForOne {
 						liquidityNet = nextTick.Cross(state.feeGrowthGlobalX128, p.FeeGrowthGlobal1X128)
 					} else {
 						liquidityNet = nextTick.Cross(p.FeeGrowthGlobal0X128, state.feeGrowthGlobalX128)
 					}
 				}
+
+				// Adjust the sign of liquidity net based on swap direction
 				if zeroForOne {
 					liquidityNet = liquidityNet.Neg()
 				}
+
+				// Update the liquidity
 				state.liquidity, err = AddDelta(state.liquidity, liquidityNet)
 				if err != nil {
-					return ZERO, ZERO, ZERO, err
+					return ZERO, ZERO, ZERO, fmt.Errorf("error updating liquidity at tick %d: %w", step.tickNext, err)
 				}
-
 			}
+
+			// Update the current tick
 			if zeroForOne {
 				state.tick = step.tickNext - 1
 			} else {
 				state.tick = step.tickNext
 			}
 		} else if !state.sqrtPriceX96.Equal(step.sqrtPriceStartX96) {
+			// If price changed but we didn't cross a tick, compute the new tick
 			state.tick, err = GetTickAtSqrtRatio(state.sqrtPriceX96)
 			if err != nil {
-				return ZERO, ZERO, ZERO, err
+				return ZERO, ZERO, ZERO, fmt.Errorf("error computing tick at price %s: %w", state.sqrtPriceX96, err)
 			}
 		}
+
+		// Debug logging for the step if needed
+		if logrus.GetLevel() >= logrus.TraceLevel {
+			logrus.Tracef("Swap step: tick=%d, price=%s, amountIn=%s, amountOut=%s, feeAmount=%s, liquidityRemaining=%s",
+				state.tick, state.sqrtPriceX96, step.amountIn, step.amountOut, step.feeAmount, state.liquidity)
+		}
 	}
+
+	// Update the pool state if this is not a static (simulation) swap
 	if !isStatic {
 		p.SqrtPriceX96 = state.sqrtPriceX96
 		if state.tick != p.TickCurrent {
@@ -329,14 +395,23 @@ func (p *CorePool) HandleSwap(zeroForOne bool, amountSpecified decimal.Decimal, 
 			p.FeeGrowthGlobal1X128 = state.feeGrowthGlobalX128
 		}
 	}
+
+	// Calculate final amounts
 	var amount0, amount1 decimal.Decimal
 	if zeroForOne == exactInput {
 		amount0 = amountSpecified.Sub(state.amountSpecifiedRemaining)
 		amount1 = state.amountCalculated
 	} else {
-		amount0 = state.amountCalculated                              // -1
-		amount1 = amountSpecified.Sub(state.amountSpecifiedRemaining) // -2
+		amount0 = state.amountCalculated
+		amount1 = amountSpecified.Sub(state.amountSpecifiedRemaining)
 	}
+
+	// Log the swap completion
+	if logrus.GetLevel() >= logrus.DebugLevel && !isStatic {
+		logrus.Debugf("Swap complete: amount0=%s, amount1=%s, newPrice=%s, newTick=%d",
+			amount0, amount1, state.sqrtPriceX96, state.tick)
+	}
+
 	return amount0, amount1, state.sqrtPriceX96, nil
 }
 
@@ -346,26 +421,33 @@ type SwapSolution struct {
 }
 
 func (p *CorePool) tryToDryRun(param *UniV3SwapEvent, amountSpec decimal.Decimal, sqrtPriceLimitX96 *decimal.Decimal) bool {
+	// Determine direction of swap from amount0 (matches JS implementation)
 	var zeroForOne = param.Amount0.IsPositive()
+
+	// Try to execute the swap with our parameters
 	amount0, amount1, priceX96, err := p.HandleSwap(zeroForOne, amountSpec, sqrtPriceLimitX96, true)
 	if err != nil {
-		logrus.Error(err)
+		// This is a dry run, so errors are expected for some parameter combinations
+		if logrus.GetLevel() >= logrus.DebugLevel {
+			logrus.Debugf("Dry run swap failed for tx: %s, error: %s", param.RawEvent.TxHash, err)
+		}
 		return false
 	}
-	result := amount0.Equal(param.Amount0) && amount1.Equal(param.Amount1) && priceX96.Equal(param.SqrtPriceX96)
-	if param.RawEvent.Address == common.HexToAddress("0xCba27C8e7115b4Eb50Aa14999BC0866674a96eCB") {
-		fmt.Println(amount0, param.Amount0)
-		fmt.Println(amount1, param.Amount1)
-		fmt.Println(sqrtPriceLimitX96, param.SqrtPriceX96)
-	}
+
+	// Check if our output exactly matches the observed event (all three values must match)
+	result := amount0.Equal(param.Amount0) &&
+		amount1.Equal(param.Amount1) &&
+		priceX96.Equal(param.SqrtPriceX96)
+
 	return result
 }
 
 func incTowardsInfinity(d decimal.Decimal) decimal.Decimal {
 	if d.IsZero() {
 		return d
-		//logrus.Fatal(d)
 	}
+
+	// Simply add/subtract 1 (equivalent to JavaScript's FullMath.incrTowardInfinity)
 	if d.IsPositive() {
 		return d.Add(ONE)
 	} else {
@@ -373,42 +455,62 @@ func incTowardsInfinity(d decimal.Decimal) decimal.Decimal {
 	}
 }
 func (p *CorePool) ResolveInputFromSwapResultEvent(param *UniV3SwapEvent) (decimal.Decimal, *decimal.Decimal, error) {
-
-	solution1 := SwapSolution{SqrtPriceLimitX96: &param.SqrtPriceX96}
-	//logrus.Infof(param.RawEvent.TxHash.String())
-	if param.Liquidity.IsZero() {
-		solution1.AmountSpecified = incTowardsInfinity(param.Amount0)
-	} else {
-		solution1.AmountSpecified = param.Amount0
+	if param == nil {
+		return ZERO, nil, fmt.Errorf("swap event is nil")
 	}
 
+	// Create a list to hold our potential solutions
+	var solutionList []SwapSolution
+
+	// Basic solutions without price limit (solution3, solution4 in JS)
+	solution3 := SwapSolution{SqrtPriceLimitX96: nil, AmountSpecified: param.Amount0}
+	solution4 := SwapSolution{SqrtPriceLimitX96: nil, AmountSpecified: param.Amount1}
+	solutionList = append(solutionList, solution3, solution4)
+
+	// Define solutions with price limits (solution1, solution2 in JS)
+	solution1 := SwapSolution{SqrtPriceLimitX96: &param.SqrtPriceX96}
 	solution2 := SwapSolution{SqrtPriceLimitX96: &param.SqrtPriceX96}
+
+	// Handle zero liquidity or -1 liquidity cases
 	if param.Liquidity.IsZero() {
+		// When liquidity is zero, adjust the amount to match the event output
+		solution1.AmountSpecified = incTowardsInfinity(param.Amount0)
 		solution2.AmountSpecified = incTowardsInfinity(param.Amount1)
 	} else {
+		solution1.AmountSpecified = param.Amount0
 		solution2.AmountSpecified = param.Amount1
 	}
 
-	solution3 := SwapSolution{SqrtPriceLimitX96: nil, AmountSpecified: param.Amount0}
-	solution4 := SwapSolution{SqrtPriceLimitX96: nil, AmountSpecified: param.Amount1}
-	solutionList := []SwapSolution{solution3, solution4}
+	// If the price changed during the swap, try additional solutions
 	if !param.SqrtPriceX96.Equal(p.SqrtPriceX96) {
-		//if param.Liquidity.Equal(decimal.NewFromInt(-1)) {
-		solution5 := SwapSolution{AmountSpecified: param.Amount0, SqrtPriceLimitX96: &param.SqrtPriceX96}
-		solution6 := SwapSolution{AmountSpecified: param.Amount1, SqrtPriceLimitX96: &param.SqrtPriceX96}
-		solutionList = append(solutionList, solution5)
-		solutionList = append(solutionList, solution6)
-		//}
-		solutionList = append(solutionList, solution1)
-		solutionList = append(solutionList, solution2)
+		// Special case for liquidity = -1 (which is how some contracts represent a special case)
+		liquidityMinus1 := decimal.NewFromInt(-1)
+		if param.Liquidity.Equal(liquidityMinus1) {
+			// In JS code, these are solution5 and solution6
+			solution5 := SwapSolution{AmountSpecified: param.Amount0, SqrtPriceLimitX96: &param.SqrtPriceX96}
+			solution6 := SwapSolution{AmountSpecified: param.Amount1, SqrtPriceLimitX96: &param.SqrtPriceX96}
+			solutionList = append(solutionList, solution5, solution6)
+		}
+
+		// Add the liquidity-adjusted solutions to the list (solution1, solution2)
+		solutionList = append(solutionList, solution1, solution2)
 	}
-	for _, solution := range solutionList {
+
+	// Try each solution
+	for i, solution := range solutionList {
+		// Check if this solution reproduces the observed swap event
 		if p.tryToDryRun(param, solution.AmountSpecified, solution.SqrtPriceLimitX96) {
+			if logrus.GetLevel() >= logrus.DebugLevel {
+				logrus.Debugf("Found swap solution %d for tx: %s, pool: %s",
+					i, param.RawEvent.TxHash, param.RawEvent.Address)
+			}
 			return solution.AmountSpecified, solution.SqrtPriceLimitX96, nil
 		}
 	}
 
-	err := fmt.Errorf("failed find swap solution %s %s", param.RawEvent.TxHash, param.RawEvent.Address)
+	// If we've tried all solutions and none worked, log details and return error
+	err := fmt.Errorf("failed to find swap solution for tx: %s, pool: %s, amount0: %s, amount1: %s, sqrtPrice: %s",
+		param.RawEvent.TxHash, param.RawEvent.Address, param.Amount0, param.Amount1, param.SqrtPriceX96)
 	logrus.Error(err)
 	return ZERO, nil, err
 }

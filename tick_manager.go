@@ -5,9 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/shopspring/decimal"
 	"math"
 	"sort"
+
+	"github.com/shopspring/decimal"
 )
 
 type Tick struct {
@@ -248,8 +249,15 @@ func (tm *TickManager) GetFeeGrowthInside(tickLower, tickUpper, tickCurrent int,
 		feeGrowthBelow0X128 = lower.FeeGrowthOutside0X128
 		feeGrowthBelow1X128 = lower.FeeGrowthOutside1X128
 	} else {
-		feeGrowthBelow0X128 = feeGrowthGlobal0X128.Sub(lower.FeeGrowthOutside0X128)
-		feeGrowthBelow1X128 = feeGrowthGlobal1X128.Sub(lower.FeeGrowthOutside1X128)
+		var err error
+		feeGrowthBelow0X128, err = Mod256Sub(feeGrowthGlobal0X128, lower.FeeGrowthOutside0X128)
+		if err != nil {
+			return ZERO, ZERO, err
+		}
+		feeGrowthBelow1X128, err = Mod256Sub(feeGrowthGlobal1X128, lower.FeeGrowthOutside1X128)
+		if err != nil {
+			return ZERO, ZERO, err
+		}
 	}
 	var feeGrowthAbove0X128 decimal.Decimal
 	var feeGrowthAbove1X128 decimal.Decimal
@@ -257,20 +265,35 @@ func (tm *TickManager) GetFeeGrowthInside(tickLower, tickUpper, tickCurrent int,
 		feeGrowthAbove0X128 = upper.FeeGrowthOutside0X128
 		feeGrowthAbove1X128 = upper.FeeGrowthOutside1X128
 	} else {
-		feeGrowthAbove0X128 = feeGrowthGlobal0X128.Sub(upper.FeeGrowthOutside0X128)
-		feeGrowthAbove1X128 = feeGrowthGlobal1X128.Sub(upper.FeeGrowthOutside1X128)
+		var err error
+		feeGrowthAbove0X128, err = Mod256Sub(feeGrowthGlobal0X128, upper.FeeGrowthOutside0X128)
+		if err != nil {
+			return ZERO, ZERO, err
+		}
+		feeGrowthAbove1X128, err = Mod256Sub(feeGrowthGlobal1X128, upper.FeeGrowthOutside1X128)
+		if err != nil {
+			return ZERO, ZERO, err
+		}
 	}
 
 	result1, err := Mod256Sub(feeGrowthGlobal0X128, feeGrowthBelow0X128)
 	if err != nil {
 		return ZERO, ZERO, err
 	}
-	result1 = result1.Sub(feeGrowthAbove0X128)
+	result1, err = Mod256Sub(result1, feeGrowthAbove0X128)
+	if err != nil {
+		return ZERO, ZERO, err
+	}
+
 	result2, err := Mod256Sub(feeGrowthGlobal1X128, feeGrowthBelow1X128)
 	if err != nil {
 		return ZERO, ZERO, err
 	}
-	result2 = result2.Sub(feeGrowthAbove1X128)
+	result2, err = Mod256Sub(result2, feeGrowthAbove1X128)
+	if err != nil {
+		return ZERO, ZERO, err
+	}
+
 	return result1, result2, nil
 }
 
